@@ -64,6 +64,11 @@ func (Domain) Register(app *kit.App) {
 		Summary: "Search authors by name",
 		Args:    []kit.Arg{{Name: "query", Help: "author name or terms"}}}, searchAuthors)
 
+	// journals: search journals and publication sources
+	kit.Handle(app, kit.OpMeta{Name: "journals", Group: "search", List: true,
+		Summary: "Search journals and publication sources",
+		Args:    []kit.Arg{{Name: "query", Help: "journal name or terms"}}}, searchJournals)
+
 	// institutions: search institutions
 	kit.Handle(app, kit.OpMeta{Name: "institutions", Group: "search", List: true,
 		Summary: "Search research institutions",
@@ -109,6 +114,7 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 type worksIn struct {
 	Query  string  `kit:"arg" help:"search terms"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Year   int     `kit:"flag" help:"filter by publication year"`
 	Client *Client `kit:"inject"`
 }
 
@@ -119,6 +125,12 @@ type workIn struct {
 
 type authorsIn struct {
 	Query  string  `kit:"arg" help:"author name or terms"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type journalsIn struct {
+	Query  string  `kit:"arg" help:"journal name or terms"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
@@ -151,9 +163,9 @@ type listRef struct {
 func searchWorks(ctx context.Context, in worksIn, emit func(*Work) error) error {
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 25
+		limit = 10
 	}
-	works, err := in.Client.SearchWorks(ctx, in.Query, limit)
+	works, err := in.Client.SearchWorks(ctx, in.Query, limit, in.Year)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -176,7 +188,7 @@ func getWork(ctx context.Context, in workIn, emit func(*Work) error) error {
 func searchAuthors(ctx context.Context, in authorsIn, emit func(*Author) error) error {
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 25
+		limit = 10
 	}
 	authors, err := in.Client.SearchAuthors(ctx, in.Query, limit)
 	if err != nil {
@@ -190,10 +202,27 @@ func searchAuthors(ctx context.Context, in authorsIn, emit func(*Author) error) 
 	return nil
 }
 
+func searchJournals(ctx context.Context, in journalsIn, emit func(*Journal) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	journals, err := in.Client.SearchJournals(ctx, in.Query, limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range journals {
+		if err := emit(&journals[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func searchInstitutions(ctx context.Context, in institutionsIn, emit func(*Institution) error) error {
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 25
+		limit = 10
 	}
 	insts, err := in.Client.SearchInstitutions(ctx, in.Query, limit)
 	if err != nil {
@@ -210,7 +239,7 @@ func searchInstitutions(ctx context.Context, in institutionsIn, emit func(*Insti
 func searchTopics(ctx context.Context, in topicsIn, emit func(*Topic) error) error {
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 25
+		limit = 10
 	}
 	topics, err := in.Client.SearchTopics(ctx, in.Query, limit)
 	if err != nil {

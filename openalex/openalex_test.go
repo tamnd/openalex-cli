@@ -63,8 +63,14 @@ const fakeAuthorsJSON = `{
       "works_count": 23,
       "cited_by_count": 9876,
       "summary_stats": {"h_index": 12},
-      "affiliations": [
-        {"institution": {"display_name": "University of Manchester"}}
+      "last_known_institutions": [
+        {"display_name": "University of Manchester"}
+      ],
+      "x_concepts": [
+        {"display_name": "Computer science", "score": 0.9},
+        {"display_name": "Mathematics", "score": 0.8},
+        {"display_name": "Artificial intelligence", "score": 0.7},
+        {"display_name": "Logic", "score": 0.6}
       ]
     },
     {
@@ -73,12 +79,27 @@ const fakeAuthorsJSON = `{
       "works_count": 5,
       "cited_by_count": 100,
       "summary_stats": {"h_index": 3},
-      "affiliations": []
+      "last_known_institutions": [],
+      "x_concepts": []
     }
   ]
 }`
 
 const emptyWorksJSON = `{"meta":{"count":0,"page":1,"per_page":1},"results":[]}`
+
+const fakeSourcesJSON = `{
+  "meta": {"count": 1, "page": 1, "per_page": 1},
+  "results": [
+    {
+      "id": "https://openalex.org/S137773608",
+      "display_name": "Nature",
+      "host_organization_name": "Springer Nature",
+      "works_count": 120000,
+      "cited_by_count": 10000000,
+      "is_oa": false
+    }
+  ]
+}`
 
 const fakeInstitutionsJSON = `{
   "meta": {"count": 1, "page": 1, "per_page": 1},
@@ -142,7 +163,7 @@ func TestSearchWorksSendsUserAgent(t *testing.T) {
 	defer ts.Close()
 
 	c := newTestClient(ts)
-	_, _ = c.SearchWorks(context.Background(), "test", 1)
+	_, _ = c.SearchWorks(context.Background(), "test", 1, 0)
 	if !strings.Contains(got, "openalex-cli") {
 		t.Errorf("User-Agent = %q, want to contain openalex-cli", got)
 	}
@@ -155,7 +176,7 @@ func TestSearchWorksParsesItems(t *testing.T) {
 	defer ts.Close()
 
 	c := newTestClient(ts)
-	works, err := c.SearchWorks(context.Background(), "ml", 2)
+	works, err := c.SearchWorks(context.Background(), "ml", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +243,7 @@ func TestSearchWorksLimitRespected(t *testing.T) {
 	defer ts.Close()
 
 	c := newTestClient(ts)
-	_, _ = c.SearchWorks(context.Background(), "test", 7)
+	_, _ = c.SearchWorks(context.Background(), "test", 7, 0)
 	if !strings.Contains(gotURL, "per-page=7") {
 		t.Errorf("URL = %q, want per-page=7", gotURL)
 	}
@@ -241,7 +262,7 @@ func TestSearchWorksRetriesOn503(t *testing.T) {
 	cfg.Rate = 0
 	cfg.Retries = 2
 	c := openalex.NewClient(cfg)
-	_, err := c.SearchWorks(context.Background(), "test", 1)
+	_, err := c.SearchWorks(context.Background(), "test", 1, 0)
 	if err == nil {
 		t.Fatal("expected error on persistent 503")
 	}
@@ -282,17 +303,23 @@ func TestSearchAuthorsParsesItems(t *testing.T) {
 	if a0.HIndex != 12 {
 		t.Errorf("HIndex = %d, want 12", a0.HIndex)
 	}
-	if a0.Affiliation != "University of Manchester" {
-		t.Errorf("Affiliation = %q, want University of Manchester", a0.Affiliation)
+	if a0.Institution != "University of Manchester" {
+		t.Errorf("Institution = %q, want University of Manchester", a0.Institution)
+	}
+	if a0.Concepts != "Computer science, Mathematics, Artificial intelligence" {
+		t.Errorf("Concepts = %q, want first 3 joined", a0.Concepts)
 	}
 	if a0.Rank != 1 {
 		t.Errorf("Rank = %d, want 1", a0.Rank)
 	}
 
-	// Second author: no affiliations
+	// Second author: no institutions or concepts
 	a1 := authors[1]
-	if a1.Affiliation != "" {
-		t.Errorf("Affiliation should be empty for no affiliations, got %q", a1.Affiliation)
+	if a1.Institution != "" {
+		t.Errorf("Institution should be empty for no institutions, got %q", a1.Institution)
+	}
+	if a1.Concepts != "" {
+		t.Errorf("Concepts should be empty, got %q", a1.Concepts)
 	}
 }
 
@@ -317,14 +344,14 @@ func TestSearchInstitutionsParsesItems(t *testing.T) {
 	if i0.Name != "Massachusetts Institute of Technology" {
 		t.Errorf("Name = %q", i0.Name)
 	}
-	if i0.CountryCode != "US" {
-		t.Errorf("CountryCode = %q, want US", i0.CountryCode)
+	if i0.Country != "US" {
+		t.Errorf("Country = %q, want US", i0.Country)
 	}
-	if i0.WorksCount != 234567 {
-		t.Errorf("WorksCount = %d, want 234567", i0.WorksCount)
+	if i0.Works != 234567 {
+		t.Errorf("Works = %d, want 234567", i0.Works)
 	}
-	if i0.CitedByCount != 12345678 {
-		t.Errorf("CitedByCount = %d, want 12345678", i0.CitedByCount)
+	if i0.Citations != 12345678 {
+		t.Errorf("Citations = %d, want 12345678", i0.Citations)
 	}
 	if i0.URL != "http://web.mit.edu/" {
 		t.Errorf("URL = %q, want http://web.mit.edu/", i0.URL)
@@ -385,6 +412,77 @@ func TestGetWorkByID(t *testing.T) {
 	}
 	if work.CitedByCount != 76543 {
 		t.Errorf("CitedByCount = %d, want 76543", work.CitedByCount)
+	}
+}
+
+func TestSearchJournalsParsesItems(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, fakeSourcesJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	journals, err := c.SearchJournals(context.Background(), "nature", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journals) != 1 {
+		t.Fatalf("want 1 journal, got %d", len(journals))
+	}
+	j0 := journals[0]
+	if j0.ID != "S137773608" {
+		t.Errorf("ID = %q, want S137773608", j0.ID)
+	}
+	if j0.Name != "Nature" {
+		t.Errorf("Name = %q, want Nature", j0.Name)
+	}
+	if j0.Publisher != "Springer Nature" {
+		t.Errorf("Publisher = %q, want Springer Nature", j0.Publisher)
+	}
+	if j0.Works != 120000 {
+		t.Errorf("Works = %d, want 120000", j0.Works)
+	}
+	if j0.Citations != 10000000 {
+		t.Errorf("Citations = %d, want 10000000", j0.Citations)
+	}
+	if j0.IsOA {
+		t.Error("IsOA should be false")
+	}
+	if j0.Rank != 1 {
+		t.Errorf("Rank = %d, want 1", j0.Rank)
+	}
+}
+
+func TestSearchJournalsURLContainsQuery(t *testing.T) {
+	var gotURL string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		_, _ = fmt.Fprint(w, fakeSourcesJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	_, _ = c.SearchJournals(context.Background(), "science", 5)
+	if !strings.Contains(gotURL, "science") {
+		t.Errorf("URL = %q, want to contain science", gotURL)
+	}
+	if !strings.Contains(gotURL, "per-page=5") {
+		t.Errorf("URL = %q, want to contain per-page=5", gotURL)
+	}
+}
+
+func TestSearchWorksYearFilter(t *testing.T) {
+	var gotURL string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		_, _ = fmt.Fprint(w, emptyWorksJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	_, _ = c.SearchWorks(context.Background(), "ml", 5, 2023)
+	if !strings.Contains(gotURL, "publication_year%3A2023") && !strings.Contains(gotURL, "publication_year:2023") {
+		t.Errorf("URL = %q, want to contain publication_year filter for 2023", gotURL)
 	}
 }
 
