@@ -89,6 +89,28 @@ type Author struct {
 	Affiliation  string `json:"affiliation"` // last institution name
 }
 
+// Institution is a research institution (university, lab, etc.).
+type Institution struct {
+	Rank         int    `json:"rank"`
+	ID           string `json:"id"` // OpenAlex ID e.g. I63966007
+	Name         string `json:"name"`
+	CountryCode  string `json:"country_code,omitempty"`
+	Type         string `json:"type,omitempty"`
+	WorksCount   int    `json:"works_count"`
+	CitedByCount int    `json:"cited_by_count"`
+	URL          string `json:"url,omitempty"` // homepage_url
+}
+
+// Topic is a research topic cluster.
+type Topic struct {
+	Rank        int    `json:"rank"`
+	ID          string `json:"id"` // OpenAlex ID e.g. T12345
+	Name        string `json:"name"`
+	WorksCount  int    `json:"works_count"`
+	Description string `json:"description,omitempty"`
+	Field       string `json:"field,omitempty"` // subfield display name
+}
+
 // --- internal API response types ---
 
 type apiWork struct {
@@ -139,6 +161,26 @@ type apiResponse[T any] struct {
 	Results []T `json:"results"`
 }
 
+type apiInstitution struct {
+	ID           string `json:"id"`
+	DisplayName  string `json:"display_name"`
+	CountryCode  string `json:"country_code"`
+	Type         string `json:"type"`
+	WorksCount   int    `json:"works_count"`
+	CitedByCount int    `json:"cited_by_count"`
+	HomepageURL  string `json:"homepage_url"`
+}
+
+type apiTopic struct {
+	ID           string `json:"id"`
+	DisplayName  string `json:"display_name"`
+	WorksCount   int    `json:"works_count"`
+	Description  string `json:"description"`
+	Subfield     struct {
+		DisplayName string `json:"display_name"`
+	} `json:"subfield"`
+}
+
 // SearchWorks queries the OpenAlex /works endpoint and returns up to limit results.
 func (c *Client) SearchWorks(ctx context.Context, query string, limit int) ([]Work, error) {
 	u := fmt.Sprintf("%s/works?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
@@ -173,6 +215,89 @@ func (c *Client) SearchAuthors(ctx context.Context, query string, limit int) ([]
 		authors = append(authors, convertAuthor(i+1, aa))
 	}
 	return authors, nil
+}
+
+// GetWork fetches a single work by OpenAlex ID or DOI.
+func (c *Client) GetWork(ctx context.Context, id string) (*Work, error) {
+	// Normalize: strip full URL prefix if given
+	if strings.HasPrefix(id, "https://openalex.org/") {
+		id = path.Base(id)
+	}
+	// DOI normalization
+	var u string
+	if strings.HasPrefix(id, "10.") {
+		u = fmt.Sprintf("%s/works/https://doi.org/%s", c.cfg.BaseURL, url.QueryEscape(id))
+	} else if strings.HasPrefix(id, "https://doi.org/") || strings.HasPrefix(id, "doi.org/") {
+		u = fmt.Sprintf("%s/works/%s", c.cfg.BaseURL, url.QueryEscape(id))
+	} else {
+		u = fmt.Sprintf("%s/works/%s", c.cfg.BaseURL, id)
+	}
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var aw apiWork
+	if err := json.Unmarshal(body, &aw); err != nil {
+		return nil, fmt.Errorf("decode work: %w", err)
+	}
+	w := convertWork(0, aw)
+	return &w, nil
+}
+
+// SearchInstitutions queries the OpenAlex /institutions endpoint.
+func (c *Client) SearchInstitutions(ctx context.Context, query string, limit int) ([]Institution, error) {
+	u := fmt.Sprintf("%s/institutions?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse[apiInstitution]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode institutions: %w", err)
+	}
+	out := make([]Institution, 0, len(resp.Results))
+	for i, ai := range resp.Results {
+		out = append(out, Institution{
+			Rank:         i + 1,
+			ID:           path.Base(ai.ID),
+			Name:         ai.DisplayName,
+			CountryCode:  ai.CountryCode,
+			Type:         ai.Type,
+			WorksCount:   ai.WorksCount,
+			CitedByCount: ai.CitedByCount,
+			URL:          ai.HomepageURL,
+		})
+	}
+	return out, nil
+}
+
+// SearchTopics queries the OpenAlex /topics endpoint.
+func (c *Client) SearchTopics(ctx context.Context, query string, limit int) ([]Topic, error) {
+	u := fmt.Sprintf("%s/topics?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse[apiTopic]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode topics: %w", err)
+	}
+	out := make([]Topic, 0, len(resp.Results))
+	for i, at := range resp.Results {
+		desc := at.Description
+		if len(desc) > 200 {
+			desc = desc[:200]
+		}
+		out = append(out, Topic{
+			Rank:        i + 1,
+			ID:          path.Base(at.ID),
+			Name:        at.DisplayName,
+			WorksCount:  at.WorksCount,
+			Description: desc,
+			Field:       at.Subfield.DisplayName,
+		})
+	}
+	return out, nil
 }
 
 func convertWork(rank int, aw apiWork) Work {

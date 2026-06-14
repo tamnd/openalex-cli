@@ -80,6 +80,52 @@ const fakeAuthorsJSON = `{
 
 const emptyWorksJSON = `{"meta":{"count":0,"page":1,"per_page":1},"results":[]}`
 
+const fakeInstitutionsJSON = `{
+  "meta": {"count": 1, "page": 1, "per_page": 1},
+  "results": [
+    {
+      "id": "https://openalex.org/I63966007",
+      "display_name": "Massachusetts Institute of Technology",
+      "country_code": "US",
+      "type": "education",
+      "works_count": 234567,
+      "cited_by_count": 12345678,
+      "homepage_url": "http://web.mit.edu/"
+    }
+  ]
+}`
+
+const fakeTopicsJSON = `{
+  "meta": {"count": 1, "page": 1, "per_page": 1},
+  "results": [
+    {
+      "id": "https://openalex.org/T12345",
+      "display_name": "Climate Change",
+      "works_count": 234567,
+      "description": "Research on anthropogenic climate change and its effects.",
+      "subfield": {"display_name": "Environmental Science"}
+    }
+  ]
+}`
+
+const fakeSingleWorkJSON = `{
+  "id": "https://openalex.org/W2741809807",
+  "doi": "https://doi.org/10.48550/arxiv.1201.0490",
+  "title": "Scikit-learn: Machine Learning in Python",
+  "display_name": "Scikit-learn: Machine Learning in Python",
+  "publication_year": 2012,
+  "type": "article",
+  "open_access": {"is_oa": true},
+  "cited_by_count": 76543,
+  "authorships": [
+    {"author": {"display_name": "Fabian Pedregosa"}}
+  ],
+  "primary_location": {
+    "source": {"display_name": "Journal of Machine Learning Research"},
+    "landing_page_url": "https://jmlr.org/papers/v12/pedregosa11a.html"
+  }
+}`
+
 func newTestClient(ts *httptest.Server) *openalex.Client {
 	cfg := openalex.DefaultConfig()
 	cfg.BaseURL = ts.URL
@@ -247,5 +293,115 @@ func TestSearchAuthorsParsesItems(t *testing.T) {
 	a1 := authors[1]
 	if a1.Affiliation != "" {
 		t.Errorf("Affiliation should be empty for no affiliations, got %q", a1.Affiliation)
+	}
+}
+
+func TestSearchInstitutionsParsesItems(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, fakeInstitutionsJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	insts, err := c.SearchInstitutions(context.Background(), "MIT", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(insts) != 1 {
+		t.Fatalf("want 1 institution, got %d", len(insts))
+	}
+	i0 := insts[0]
+	if i0.ID != "I63966007" {
+		t.Errorf("ID = %q, want I63966007", i0.ID)
+	}
+	if i0.Name != "Massachusetts Institute of Technology" {
+		t.Errorf("Name = %q", i0.Name)
+	}
+	if i0.CountryCode != "US" {
+		t.Errorf("CountryCode = %q, want US", i0.CountryCode)
+	}
+	if i0.WorksCount != 234567 {
+		t.Errorf("WorksCount = %d, want 234567", i0.WorksCount)
+	}
+	if i0.CitedByCount != 12345678 {
+		t.Errorf("CitedByCount = %d, want 12345678", i0.CitedByCount)
+	}
+	if i0.URL != "http://web.mit.edu/" {
+		t.Errorf("URL = %q, want http://web.mit.edu/", i0.URL)
+	}
+	if i0.Rank != 1 {
+		t.Errorf("Rank = %d, want 1", i0.Rank)
+	}
+}
+
+func TestSearchTopicsParsesItems(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, fakeTopicsJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	topics, err := c.SearchTopics(context.Background(), "climate", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(topics) != 1 {
+		t.Fatalf("want 1 topic, got %d", len(topics))
+	}
+	t0 := topics[0]
+	if t0.ID != "T12345" {
+		t.Errorf("ID = %q, want T12345", t0.ID)
+	}
+	if t0.Name != "Climate Change" {
+		t.Errorf("Name = %q, want Climate Change", t0.Name)
+	}
+	if t0.WorksCount != 234567 {
+		t.Errorf("WorksCount = %d, want 234567", t0.WorksCount)
+	}
+	if t0.Field != "Environmental Science" {
+		t.Errorf("Field = %q, want Environmental Science", t0.Field)
+	}
+	if t0.Rank != 1 {
+		t.Errorf("Rank = %d, want 1", t0.Rank)
+	}
+}
+
+func TestGetWorkByID(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, fakeSingleWorkJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	work, err := c.GetWork(context.Background(), "W2741809807")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if work.ID != "W2741809807" {
+		t.Errorf("ID = %q, want W2741809807", work.ID)
+	}
+	if work.Year != 2012 {
+		t.Errorf("Year = %d, want 2012", work.Year)
+	}
+	if work.CitedByCount != 76543 {
+		t.Errorf("CitedByCount = %d, want 76543", work.CitedByCount)
+	}
+}
+
+func TestSearchInstitutionsURLContainsQuery(t *testing.T) {
+	var gotURL string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		_, _ = fmt.Fprint(w, fakeInstitutionsJSON)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	_, _ = c.SearchInstitutions(context.Background(), "Stanford", 5)
+	if !strings.Contains(gotURL, "Stanford") {
+		t.Errorf("URL = %q, want to contain Stanford", gotURL)
+	}
+	if !strings.Contains(gotURL, "per-page=5") {
+		t.Errorf("URL = %q, want to contain per-page=5", gotURL)
 	}
 }

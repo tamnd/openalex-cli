@@ -54,10 +54,25 @@ func (Domain) Register(app *kit.App) {
 		Summary: "Search scholarly works (papers, preprints, books, datasets)",
 		Args:    []kit.Arg{{Name: "query", Help: "search terms"}}}, searchWorks)
 
+	// work: fetch a single work by ID or DOI
+	kit.Handle(app, kit.OpMeta{Name: "work", Group: "search", Single: true,
+		Summary: "Fetch a work by OpenAlex ID or DOI", URIType: "work", Resolver: true,
+		Args: []kit.Arg{{Name: "id", Help: "OpenAlex ID (W2741809807) or DOI"}}}, getWork)
+
 	// authors: search authors
 	kit.Handle(app, kit.OpMeta{Name: "authors", Group: "search", List: true,
 		Summary: "Search authors by name",
 		Args:    []kit.Arg{{Name: "query", Help: "author name or terms"}}}, searchAuthors)
+
+	// institutions: search institutions
+	kit.Handle(app, kit.OpMeta{Name: "institutions", Group: "search", List: true,
+		Summary: "Search research institutions",
+		Args:    []kit.Arg{{Name: "query", Help: "institution name or terms"}}}, searchInstitutions)
+
+	// topics: search topics
+	kit.Handle(app, kit.OpMeta{Name: "topics", Group: "search", List: true,
+		Summary: "Search research topics",
+		Args:    []kit.Arg{{Name: "query", Help: "topic name or terms"}}}, searchTopics)
 
 	// page: fetch a raw page by path (scaffold fallback, kept for URI driver)
 	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
@@ -97,8 +112,25 @@ type worksIn struct {
 	Client *Client `kit:"inject"`
 }
 
+type workIn struct {
+	ID     string  `kit:"arg" help:"OpenAlex ID (W2741809807) or DOI"`
+	Client *Client `kit:"inject"`
+}
+
 type authorsIn struct {
 	Query  string  `kit:"arg" help:"author name or terms"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type institutionsIn struct {
+	Query  string  `kit:"arg" help:"institution name or terms"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type topicsIn struct {
+	Query  string  `kit:"arg" help:"topic name or terms"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
@@ -133,6 +165,14 @@ func searchWorks(ctx context.Context, in worksIn, emit func(*Work) error) error 
 	return nil
 }
 
+func getWork(ctx context.Context, in workIn, emit func(*Work) error) error {
+	w, err := in.Client.GetWork(ctx, in.ID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(w)
+}
+
 func searchAuthors(ctx context.Context, in authorsIn, emit func(*Author) error) error {
 	limit := in.Limit
 	if limit <= 0 {
@@ -144,6 +184,40 @@ func searchAuthors(ctx context.Context, in authorsIn, emit func(*Author) error) 
 	}
 	for i := range authors {
 		if err := emit(&authors[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func searchInstitutions(ctx context.Context, in institutionsIn, emit func(*Institution) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	insts, err := in.Client.SearchInstitutions(ctx, in.Query, limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range insts {
+		if err := emit(&insts[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func searchTopics(ctx context.Context, in topicsIn, emit func(*Topic) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	topics, err := in.Client.SearchTopics(ctx, in.Query, limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range topics {
+		if err := emit(&topics[i]); err != nil {
 			return err
 		}
 	}
