@@ -4,59 +4,253 @@
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package openalex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to openalex. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "openalex/dev (+https://github.com/tamnd/openalex-cli)"
+// DefaultUserAgent identifies the client to OpenAlex. The mailto: hint opts
+// into the polite pool for higher rate limits.
+const DefaultUserAgent = "openalex-cli/dev (https://github.com/tamnd/openalex-cli; mailto:bot@example.com)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at openalex.com; change it once you
-// know the real endpoints you want to read.
-const Host = "openalex.com"
+// Host is the site this client talks to.
+const Host = "api.openalex.org"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to openalex over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunables for the client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns a Config with sensible defaults for the OpenAlex API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to OpenAlex over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client with the given config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Work is a single scholarly work (paper, preprint, book, dataset, etc.).
+type Work struct {
+	Rank         int      `json:"rank"`
+	ID           string   `json:"id"` // OpenAlex ID e.g. W2741809807
+	DOI          string   `json:"doi"`
+	Title        string   `json:"title"`
+	Year         int      `json:"year"`
+	Type         string   `json:"type"` // article, preprint, book, etc.
+	OpenAccess   bool     `json:"open_access"`
+	CitedByCount int      `json:"cited_by_count"`
+	Authors      []string `json:"authors"`       // first 3 author display names
+	PrimaryVenue string   `json:"primary_venue"` // journal or source name
+	URL          string   `json:"url"`           // doi URL or landing page
+}
+
+// Author is an individual researcher with career statistics.
+type Author struct {
+	Rank         int    `json:"rank"`
+	ID           string `json:"id"` // OpenAlex ID e.g. A27320202
+	Name         string `json:"name"`
+	WorksCount   int    `json:"works_count"`
+	CitedByCount int    `json:"cited_by_count"`
+	HIndex       int    `json:"h_index"`     // from summary_stats.h_index
+	Affiliation  string `json:"affiliation"` // last institution name
+}
+
+// --- internal API response types ---
+
+type apiWork struct {
+	ID              string `json:"id"`
+	DOI             string `json:"doi"`
+	Title           string `json:"title"`
+	DisplayName     string `json:"display_name"`
+	PublicationYear int    `json:"publication_year"`
+	Type            string `json:"type"`
+	OpenAccess      struct {
+		IsOA bool `json:"is_oa"`
+	} `json:"open_access"`
+	CitedByCount int `json:"cited_by_count"`
+	Authorships  []struct {
+		Author struct {
+			DisplayName string `json:"display_name"`
+		} `json:"author"`
+	} `json:"authorships"`
+	PrimaryLocation *struct {
+		Source *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"source"`
+		LandingPageURL string `json:"landing_page_url"`
+	} `json:"primary_location"`
+}
+
+type apiAuthor struct {
+	ID           string `json:"id"`
+	DisplayName  string `json:"display_name"`
+	WorksCount   int    `json:"works_count"`
+	CitedByCount int    `json:"cited_by_count"`
+	SummaryStats struct {
+		HIndex int `json:"h_index"`
+	} `json:"summary_stats"`
+	Affiliations []struct {
+		Institution struct {
+			DisplayName string `json:"display_name"`
+		} `json:"institution"`
+	} `json:"affiliations"`
+}
+
+type apiResponse[T any] struct {
+	Meta struct {
+		Count   int `json:"count"`
+		Page    int `json:"page"`
+		PerPage int `json:"per_page"`
+	} `json:"meta"`
+	Results []T `json:"results"`
+}
+
+// SearchWorks queries the OpenAlex /works endpoint and returns up to limit results.
+func (c *Client) SearchWorks(ctx context.Context, query string, limit int) ([]Work, error) {
+	u := fmt.Sprintf("%s/works?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse[apiWork]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode works: %w", err)
+	}
+	works := make([]Work, 0, len(resp.Results))
+	for i, aw := range resp.Results {
+		works = append(works, convertWork(i+1, aw))
+	}
+	return works, nil
+}
+
+// SearchAuthors queries the OpenAlex /authors endpoint and returns up to limit results.
+func (c *Client) SearchAuthors(ctx context.Context, query string, limit int) ([]Author, error) {
+	u := fmt.Sprintf("%s/authors?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse[apiAuthor]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode authors: %w", err)
+	}
+	authors := make([]Author, 0, len(resp.Results))
+	for i, aa := range resp.Results {
+		authors = append(authors, convertAuthor(i+1, aa))
+	}
+	return authors, nil
+}
+
+func convertWork(rank int, aw apiWork) Work {
+	title := aw.DisplayName
+	if title == "" {
+		title = aw.Title
+	}
+
+	// Extract short ID from full URL e.g. https://openalex.org/W2741809807 → W2741809807
+	id := path.Base(aw.ID)
+
+	// Collect first 3 authors
+	var authors []string
+	for _, a := range aw.Authorships {
+		if len(authors) >= 3 {
+			break
+		}
+		if n := a.Author.DisplayName; n != "" {
+			authors = append(authors, n)
+		}
+	}
+
+	// Primary venue
+	var venue string
+	var landingURL string
+	if aw.PrimaryLocation != nil {
+		if aw.PrimaryLocation.Source != nil {
+			venue = aw.PrimaryLocation.Source.DisplayName
+		}
+		landingURL = aw.PrimaryLocation.LandingPageURL
+	}
+
+	// URL: prefer DOI, fall back to landing page
+	workURL := aw.DOI
+	if workURL == "" {
+		workURL = landingURL
+	}
+
+	return Work{
+		Rank:         rank,
+		ID:           id,
+		DOI:          aw.DOI,
+		Title:        title,
+		Year:         aw.PublicationYear,
+		Type:         aw.Type,
+		OpenAccess:   aw.OpenAccess.IsOA,
+		CitedByCount: aw.CitedByCount,
+		Authors:      authors,
+		PrimaryVenue: venue,
+		URL:          workURL,
+	}
+}
+
+func convertAuthor(rank int, aa apiAuthor) Author {
+	id := path.Base(aa.ID)
+
+	// Use last affiliation
+	var affiliation string
+	if len(aa.Affiliations) > 0 {
+		affiliation = aa.Affiliations[len(aa.Affiliations)-1].Institution.DisplayName
+	}
+
+	return Author{
+		Rank:         rank,
+		ID:           id,
+		Name:         aa.DisplayName,
+		WorksCount:   aa.WorksCount,
+		CitedByCount: aa.CitedByCount,
+		HIndex:       aa.SummaryStats.HIndex,
+		Affiliation:  affiliation,
+	}
+}
+
+// get fetches url and returns the response body. It paces and retries on
+// transient errors (429 / 5xx).
+func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +258,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, u)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +267,18 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", u, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, u string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,28 +300,22 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
+	return min(time.Duration(attempt)*500*time.Millisecond, 5*time.Second)
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on openalex.com. It is a stand-in for the typed records you
-// will model from the real openalex endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `openalex cat` and the Markdown export print.
+// --- scaffold compatibility: Page type and GetPage/PageLinks kept for domain.go ---
+
+// Page is used by the kit domain driver as the URI-addressable resource.
 type Page struct {
 	ID    string `json:"id" kit:"id"`
 	URL   string `json:"url"`
@@ -135,36 +323,32 @@ type Page struct {
 	Body  string `json:"body,omitempty" kit:"body"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// GetPage fetches one page by its path.
+func (c *Client) GetPage(ctx context.Context, p string) (*Page, error) {
+	p = strings.Trim(p, "/")
+	u := BaseURL + "/" + p
+	body, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	return &Page{ID: p, URL: u, Title: p, Body: pageText(body)}, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// PageLinks is kept for the kit domain driver.
+func (c *Client) PageLinks(ctx context.Context, p string, limit int) ([]*Page, error) {
+	p = strings.Trim(p, "/")
+	body, err := c.get(ctx, BaseURL+"/"+p)
 	if err != nil {
 		return nil, err
 	}
 	var out []*Page
 	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	for _, lp := range linkPaths(body) {
+		if seen[lp] {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
+		seen[lp] = true
+		out = append(out, &Page{ID: lp, URL: BaseURL + "/" + lp})
 		if limit > 0 && len(out) >= limit {
 			break
 		}
@@ -172,25 +356,6 @@ func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
 func pageText(body []byte) string {
 	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
 	if len(s) > 500 {
