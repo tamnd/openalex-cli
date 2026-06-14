@@ -18,9 +18,11 @@ import (
 	"time"
 )
 
-// DefaultUserAgent identifies the client to OpenAlex. The mailto: hint opts
-// into the polite pool for higher rate limits.
-const DefaultUserAgent = "openalex-cli/dev (https://github.com/tamnd/openalex-cli; mailto:bot@example.com)"
+// DefaultUserAgent identifies the client to OpenAlex.
+const DefaultUserAgent = "openalex-cli/0.1 (tamnd87@gmail.com)"
+
+// DefaultEmail is the polite-pool email sent as mailto= on every request.
+const DefaultEmail = "tamnd87@gmail.com"
 
 // Host is the site this client talks to.
 const Host = "api.openalex.org"
@@ -32,6 +34,7 @@ const BaseURL = "https://" + Host
 type Config struct {
 	BaseURL   string
 	UserAgent string
+	Email     string
 	Rate      time.Duration
 	Timeout   time.Duration
 	Retries   int
@@ -42,8 +45,9 @@ func DefaultConfig() Config {
 	return Config{
 		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
+		Email:     DefaultEmail,
 		Rate:      200 * time.Millisecond,
-		Timeout:   30 * time.Second,
+		Timeout:   15 * time.Second,
 		Retries:   3,
 	}
 }
@@ -66,7 +70,7 @@ func NewClient(cfg Config) *Client {
 // Work is a single scholarly work (paper, preprint, book, dataset, etc.).
 type Work struct {
 	Rank         int      `json:"rank"`
-	ID           string   `json:"id"` // OpenAlex ID e.g. W2741809807
+	ID           string   `json:"id" kit:"id"` // OpenAlex ID e.g. W2741809807
 	DOI          string   `json:"doi"`
 	Title        string   `json:"title"`
 	Year         int      `json:"year"`
@@ -80,31 +84,43 @@ type Work struct {
 
 // Author is an individual researcher with career statistics.
 type Author struct {
+	Rank        int    `json:"rank"`
+	ID          string `json:"id" kit:"id"` // OpenAlex ID e.g. A27320202
+	Name        string `json:"name"`
+	WorksCount  int    `json:"works_count"`
+	CitedByCount int   `json:"cited_by_count"`
+	HIndex      int    `json:"h_index"`    // from summary_stats.h_index
+	Institution string `json:"institution"` // last_known_institutions[0].display_name
+	Concepts    string `json:"concepts"`    // comma-join first 3 x_concepts
+}
+
+// Journal is a publication venue (journal, conference, repository, etc.).
+type Journal struct {
 	Rank         int    `json:"rank"`
-	ID           string `json:"id"` // OpenAlex ID e.g. A27320202
+	ID           string `json:"id" kit:"id"` // OpenAlex ID e.g. S137773608
 	Name         string `json:"name"`
-	WorksCount   int    `json:"works_count"`
-	CitedByCount int    `json:"cited_by_count"`
-	HIndex       int    `json:"h_index"`     // from summary_stats.h_index
-	Affiliation  string `json:"affiliation"` // last institution name
+	Publisher    string `json:"publisher"`   // host_organization_name
+	Works        int    `json:"works_count"`
+	Citations    int    `json:"cited_by_count"`
+	IsOA         bool   `json:"is_oa"`
 }
 
 // Institution is a research institution (university, lab, etc.).
 type Institution struct {
 	Rank         int    `json:"rank"`
-	ID           string `json:"id"` // OpenAlex ID e.g. I63966007
+	ID           string `json:"id" kit:"id"` // OpenAlex ID e.g. I63966007
 	Name         string `json:"name"`
-	CountryCode  string `json:"country_code,omitempty"`
-	Type         string `json:"type,omitempty"`
-	WorksCount   int    `json:"works_count"`
-	CitedByCount int    `json:"cited_by_count"`
+	Country      string `json:"country"`  // country_code
+	Type         string `json:"type"`
+	Works        int    `json:"works_count"`
+	Citations    int    `json:"cited_by_count"`
 	URL          string `json:"url,omitempty"` // homepage_url
 }
 
 // Topic is a research topic cluster.
 type Topic struct {
 	Rank        int    `json:"rank"`
-	ID          string `json:"id"` // OpenAlex ID e.g. T12345
+	ID          string `json:"id" kit:"id"` // OpenAlex ID e.g. T12345
 	Name        string `json:"name"`
 	WorksCount  int    `json:"works_count"`
 	Description string `json:"description,omitempty"`
@@ -145,11 +161,22 @@ type apiAuthor struct {
 	SummaryStats struct {
 		HIndex int `json:"h_index"`
 	} `json:"summary_stats"`
-	Affiliations []struct {
-		Institution struct {
-			DisplayName string `json:"display_name"`
-		} `json:"institution"`
-	} `json:"affiliations"`
+	LastKnownInstitutions []struct {
+		DisplayName string `json:"display_name"`
+	} `json:"last_known_institutions"`
+	XConcepts []struct {
+		DisplayName string  `json:"display_name"`
+		Score       float64 `json:"score"`
+	} `json:"x_concepts"`
+}
+
+type apiSource struct {
+	ID                   string `json:"id"`
+	DisplayName          string `json:"display_name"`
+	HostOrganizationName string `json:"host_organization_name"`
+	WorksCount           int    `json:"works_count"`
+	CitedByCount         int    `json:"cited_by_count"`
+	IsOA                 bool   `json:"is_oa"`
 }
 
 type apiResponse[T any] struct {
@@ -182,8 +209,14 @@ type apiTopic struct {
 }
 
 // SearchWorks queries the OpenAlex /works endpoint and returns up to limit results.
-func (c *Client) SearchWorks(ctx context.Context, query string, limit int) ([]Work, error) {
-	u := fmt.Sprintf("%s/works?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+// If year > 0 it adds a publication_year filter.
+func (c *Client) SearchWorks(ctx context.Context, query string, limit int, year int) ([]Work, error) {
+	filter := "title.search:" + url.QueryEscape(query)
+	if year > 0 {
+		filter += ",publication_year:" + fmt.Sprintf("%d", year)
+	}
+	u := fmt.Sprintf("%s/works?filter=%s&per-page=%d&mailto=%s",
+		c.cfg.BaseURL, filter, limit, url.QueryEscape(c.cfg.Email))
 	body, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
@@ -201,7 +234,9 @@ func (c *Client) SearchWorks(ctx context.Context, query string, limit int) ([]Wo
 
 // SearchAuthors queries the OpenAlex /authors endpoint and returns up to limit results.
 func (c *Client) SearchAuthors(ctx context.Context, query string, limit int) ([]Author, error) {
-	u := fmt.Sprintf("%s/authors?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+	filter := "display_name.search:" + url.QueryEscape(query)
+	u := fmt.Sprintf("%s/authors?filter=%s&per-page=%d&mailto=%s",
+		c.cfg.BaseURL, filter, limit, url.QueryEscape(c.cfg.Email))
 	body, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
@@ -217,6 +252,34 @@ func (c *Client) SearchAuthors(ctx context.Context, query string, limit int) ([]
 	return authors, nil
 }
 
+// SearchJournals queries the OpenAlex /sources endpoint and returns up to limit results.
+func (c *Client) SearchJournals(ctx context.Context, query string, limit int) ([]Journal, error) {
+	filter := "display_name.search:" + url.QueryEscape(query)
+	u := fmt.Sprintf("%s/sources?filter=%s&per-page=%d&mailto=%s",
+		c.cfg.BaseURL, filter, limit, url.QueryEscape(c.cfg.Email))
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse[apiSource]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode sources: %w", err)
+	}
+	out := make([]Journal, 0, len(resp.Results))
+	for i, s := range resp.Results {
+		out = append(out, Journal{
+			Rank:      i + 1,
+			ID:        path.Base(s.ID),
+			Name:      s.DisplayName,
+			Publisher: s.HostOrganizationName,
+			Works:     s.WorksCount,
+			Citations: s.CitedByCount,
+			IsOA:      s.IsOA,
+		})
+	}
+	return out, nil
+}
+
 // GetWork fetches a single work by OpenAlex ID or DOI.
 func (c *Client) GetWork(ctx context.Context, id string) (*Work, error) {
 	// Normalize: strip full URL prefix if given
@@ -226,11 +289,14 @@ func (c *Client) GetWork(ctx context.Context, id string) (*Work, error) {
 	// DOI normalization
 	var u string
 	if strings.HasPrefix(id, "10.") {
-		u = fmt.Sprintf("%s/works/https://doi.org/%s", c.cfg.BaseURL, url.QueryEscape(id))
+		u = fmt.Sprintf("%s/works/https://doi.org/%s?mailto=%s",
+			c.cfg.BaseURL, url.QueryEscape(id), url.QueryEscape(c.cfg.Email))
 	} else if strings.HasPrefix(id, "https://doi.org/") || strings.HasPrefix(id, "doi.org/") {
-		u = fmt.Sprintf("%s/works/%s", c.cfg.BaseURL, url.QueryEscape(id))
+		u = fmt.Sprintf("%s/works/%s?mailto=%s",
+			c.cfg.BaseURL, url.QueryEscape(id), url.QueryEscape(c.cfg.Email))
 	} else {
-		u = fmt.Sprintf("%s/works/%s", c.cfg.BaseURL, id)
+		u = fmt.Sprintf("%s/works/%s?mailto=%s",
+			c.cfg.BaseURL, id, url.QueryEscape(c.cfg.Email))
 	}
 	body, err := c.get(ctx, u)
 	if err != nil {
@@ -246,7 +312,9 @@ func (c *Client) GetWork(ctx context.Context, id string) (*Work, error) {
 
 // SearchInstitutions queries the OpenAlex /institutions endpoint.
 func (c *Client) SearchInstitutions(ctx context.Context, query string, limit int) ([]Institution, error) {
-	u := fmt.Sprintf("%s/institutions?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+	filter := "display_name.search:" + url.QueryEscape(query)
+	u := fmt.Sprintf("%s/institutions?filter=%s&per-page=%d&mailto=%s",
+		c.cfg.BaseURL, filter, limit, url.QueryEscape(c.cfg.Email))
 	body, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
@@ -258,14 +326,14 @@ func (c *Client) SearchInstitutions(ctx context.Context, query string, limit int
 	out := make([]Institution, 0, len(resp.Results))
 	for i, ai := range resp.Results {
 		out = append(out, Institution{
-			Rank:         i + 1,
-			ID:           path.Base(ai.ID),
-			Name:         ai.DisplayName,
-			CountryCode:  ai.CountryCode,
-			Type:         ai.Type,
-			WorksCount:   ai.WorksCount,
-			CitedByCount: ai.CitedByCount,
-			URL:          ai.HomepageURL,
+			Rank:      i + 1,
+			ID:        path.Base(ai.ID),
+			Name:      ai.DisplayName,
+			Country:   ai.CountryCode,
+			Type:      ai.Type,
+			Works:     ai.WorksCount,
+			Citations: ai.CitedByCount,
+			URL:       ai.HomepageURL,
 		})
 	}
 	return out, nil
@@ -273,7 +341,8 @@ func (c *Client) SearchInstitutions(ctx context.Context, query string, limit int
 
 // SearchTopics queries the OpenAlex /topics endpoint.
 func (c *Client) SearchTopics(ctx context.Context, query string, limit int) ([]Topic, error) {
-	u := fmt.Sprintf("%s/topics?search=%s&per-page=%d", c.cfg.BaseURL, url.QueryEscape(query), limit)
+	u := fmt.Sprintf("%s/topics?search=%s&per-page=%d&mailto=%s",
+		c.cfg.BaseURL, url.QueryEscape(query), limit, url.QueryEscape(c.cfg.Email))
 	body, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
@@ -354,10 +423,21 @@ func convertWork(rank int, aw apiWork) Work {
 func convertAuthor(rank int, aa apiAuthor) Author {
 	id := path.Base(aa.ID)
 
-	// Use last affiliation
-	var affiliation string
-	if len(aa.Affiliations) > 0 {
-		affiliation = aa.Affiliations[len(aa.Affiliations)-1].Institution.DisplayName
+	// Use first last_known_institution (most recent)
+	var institution string
+	if len(aa.LastKnownInstitutions) > 0 {
+		institution = aa.LastKnownInstitutions[0].DisplayName
+	}
+
+	// Comma-join first 3 x_concepts
+	var concepts []string
+	for _, c := range aa.XConcepts {
+		if len(concepts) >= 3 {
+			break
+		}
+		if c.DisplayName != "" {
+			concepts = append(concepts, c.DisplayName)
+		}
 	}
 
 	return Author{
@@ -367,7 +447,8 @@ func convertAuthor(rank int, aa apiAuthor) Author {
 		WorksCount:   aa.WorksCount,
 		CitedByCount: aa.CitedByCount,
 		HIndex:       aa.SummaryStats.HIndex,
-		Affiliation:  affiliation,
+		Institution:  institution,
+		Concepts:     strings.Join(concepts, ", "),
 	}
 }
 
